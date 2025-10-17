@@ -2,127 +2,99 @@ import express from 'express';
 import { request } from 'undici';
 import * as cheerio from 'cheerio';
 
-const PORT = process.env.PORT || 3000;
 const app = express();
+const PORT = process.env.PORT || 3000;
 
 
-async function fetchAndParseSERP(searchQuery) {
-  const searchUrl = `https://www.google.com/search?hl=en&q=${encodeURIComponent(searchQuery)}&output=search`;
-  
+async function fetchSerpHtml(searchQuery) {
+  const searchUrl = `https://www.google.com/search?hl=en&q=${encodeURIComponent(searchQuery)}`;
+
   const headers = {
-    'User-Agent': 'Mozilla/4.0 (compatible; MSIE 7.0; Windows Phone OS 7.0; Trident/3.1; IEMobile/7.1; ARM; Touch; LG; LG-E900)'
+    'User-Agent': 'Mozilla/5.0 (Linux; Android 11; sdk_gphone_x86 Build/RSR1.240422.006; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/83.0.4103.106 Mobile Safari/537.36 GSA/11.13.8.21.x86'
   };
 
-  let htmlBody;
   try {
     const { statusCode, body } = await request(searchUrl, { headers });
 
     if (statusCode !== 200) {
       throw new Error(`Request failed with status code ${statusCode}`);
     }
-    
-    htmlBody = await body.text();
-    
+
+    return await body.text();
   } catch (error) {
     console.error('Error fetching SERP data:', error.message);
     throw new Error(`Failed to fetch SERP: ${error.message}`);
   }
-
-  const $ = cheerio.load(htmlBody);
-
-  const serpData = {
-    search_parameters: {
-      query: searchQuery,
-    },
-    organic_results: [],
-    related_searches: [],
-    pagination: {}
-  };
-
-  serpData.search_parameters.location = $('div.HddGcc > span.VYM29').text().trim();
-
-  const nextLink = $('table.uZgmoc a.frGj1b').attr('href');
-  if (nextLink) {
-    serpData.pagination.next_page_link = `https://www.google.com${nextLink}`;
-  }
-
-  $('div.ezO2md').each((index, element) => {
-    const container = $(element);
-
-    const titleLinkElement = container.find('a.fuLhoc.ZWRArf');
-    const titleTextElement = titleLinkElement.find('span.CVA68e');
-
-    if (titleLinkElement.length > 0 && titleTextElement.length > 0) {
-      const organicResult = {};
-      organicResult.position = serpData.organic_results.length + 1;
-      organicResult.title = titleTextElement.text().trim();
-      
-      const redirectLink = titleLinkElement.attr('href');
-      organicResult.redirect_link = redirectLink;
-
-      try {
-        const urlParams = new URLSearchParams(redirectLink.split('?')[1]);
-        organicResult.link = urlParams.get('q');
-      } catch (e) {
-        organicResult.link = redirectLink;
-      }
-
-      organicResult.displayed_url = container.find('span.qXLe6d.dXDvrc > span.fYyStc').text().trim();
-      organicResult.snippet = container.find('span.qXLe6d.FrIlee > span.fYyStc').first().text().trim();
-
-      serpData.organic_results.push(organicResult);
-      return; 
-    }
-
-    const relatedHeader = container.find('span.dloBPe.fYyStc');
-    if (relatedHeader.length > 0 && relatedHeader.text().trim() === 'Related searches') {
-      container.find('table.VeHcBf a.ZWRArf').each((i, el) => {
-        const relatedItem = $(el);
-        serpData.related_searches.push({
-          query: relatedItem.find('span.fYyStc').text().trim(),
-          link: `https://www.google.com${relatedItem.attr('href')}` 
-        });
-      });
-    }
-  });
-
-  return serpData;
 }
 
 
+function parseSerpHtml(htmlContent) {
+  const $ = cheerio.load(htmlContent);
+  const organicResults = [];
+  const relatedQuestions = [];
 
-app.use(express.json());
+  $('div.Ww4FFb.vt6azd.xpd').each((index, element) => {
+    const linkElement = $(element).find('a.rTyHce');
+    const title = $(element).find('div.MBeuO').text();
+    const rawLink = linkElement.attr('href');
+    
+    let link = '';
+    if (rawLink && rawLink.startsWith('/url?q=')) {
+      const urlParams = new URLSearchParams(rawLink.split('?')[1]);
+      link = urlParams.get('q');
+    }
 
-/**
- * GET /search
- * Requires a 'q' query parameter.
- * Example: /search?q=Guruai
- */
+    const displayed_link = $(element).find('span.nC62wb').text();
+    const snippet = $(element).find('div.VwiC3b').text();
+
+    if (title && link) {
+      organicResults.push({
+        position: organicResults.length + 1,
+        title,
+        link,
+        displayed_link,
+        snippet,
+      });
+    }
+  });
+  
+  $('div.related-question-pair').each((index, element) => {
+    const question = $(element).find('span.JCzEY').text();
+    if (question) {
+        relatedQuestions.push(question);
+    }
+  });
+
+  return {
+    organic_results: organicResults,
+    related_questions: relatedQuestions,
+  };
+}
+
+
 app.get('/search', async (req, res) => {
-  const { q } = req.query;
-  if (!q) {
-    return res.status(400).json({ 
-      error: 'Missing required query parameter "q"' 
-    });
+  const { q: searchQuery } = req.query;
+
+  if (!searchQuery) {
+    return res.status(400).json({ error: 'Search query parameter "q" is required.' });
   }
 
-  console.log(`Received search request for: ${q}`);
+  console.log(`Received search query: "${searchQuery}"`);
 
   try {
-    const data = await fetchAndParseSERP(q);
-    
-    res.status(200).json(data);
+    const html = await fetchSerpHtml(searchQuery);
 
+    const jsonData = parseSerpHtml(html);
+
+    res.json(jsonData);
   } catch (error) {
-    console.error('Error in /search route:', error);
-    res.status(500).json({ 
-      error: 'Internal Server Error', 
-      details: error.message 
-    });
+    res.status(500).json({ error: error.message });
   }
 });
 
 
 app.listen(PORT, () => {
-  console.log(`API server running on http://localhost:${PORT}`);
+  console.log(`Server is running on http://localhost:${PORT}`);
+  console.log('Usage: http://localhost:3000/search?q=your-query-here');
 });
+
